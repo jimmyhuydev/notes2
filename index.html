@@ -1,0 +1,200 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure Personal Timeline</title>
+    <style>
+        :root { --bg: #f4f7f6; --primary: #2c3e50; --accent: #3498db; --success: #27ae60; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: var(--bg); color: var(--primary); margin: 0; padding: 20px; }
+        .container { max-width: 800px; margin: auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 5px 15px rgba(0,0,0,0.1); }
+        .hidden { display: none; }
+        input, textarea { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 1rem; }
+        button { background: var(--accent); color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; transition: 0.3s; font-weight: bold; }
+        button:hover { opacity: 0.8; }
+        .entry { border-left: 4px solid var(--accent); padding: 15px; margin: 20px 0; background: #fafafa; border-radius: 0 6px 6px 0; position: relative; }
+        .date { font-size: 0.8rem; color: #7f8c8d; margin-bottom: 8px; font-weight: bold; }
+        .controls { margin-top: 10px; display: flex; gap: 10px; }
+        .btn-edit { background: #f39c12; font-size: 0.8rem; }
+        .btn-cancel { background: #95a5a6; }
+        .search-bar { background: #ecf0f1; border: 2px solid #bdc3c7; }
+        hr { border: 0; border-top: 1px solid #eee; margin: 20px 0; }
+    </style>
+</head>
+<body>
+
+<div class="container" id="login-section">
+    <h2>🔐 Access Your Vault</h2>
+    <p>Enter password to decrypt your local storage.</p>
+    <input type="password" id="password-input" placeholder="Your Secret Password">
+    <button onclick="unlockVault()">Unlock</button>
+</div>
+
+<div class="container hidden" id="app-section">
+	<button onclick="exportBackup()" style="background:#8e44ad;">💾 Download Backup</button>
+	<button onclick="importBackup()" style="background:#2c3e50;">📥 Import Backup</button>
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+        <h2>📓 My Timeline</h2>
+        <button onclick="lockVault()" style="background:#e74c3c;">Lock & Exit</button>
+    </div>
+    
+    <input type="text" id="search-input" class="search-bar" placeholder="🔍 Search entries..." oninput="renderEntries()">
+    
+    <div id="editor-container">
+        <textarea id="note-input" rows="4" placeholder="What happened today?"></textarea>
+        <div class="controls">
+            <button id="save-btn" onclick="addOrUpdateEntry()">Save Entry</button>
+            <button id="cancel-btn" class="btn-cancel hidden" onclick="resetEditor()">Cancel Edit</button>
+        </div>
+    </div>
+
+    <hr>
+    <div id="timeline-display"></div>
+</div>
+
+<script>
+    let encryptedData = localStorage.getItem('vault_data');
+    let salt = localStorage.getItem('vault_salt');
+    let sessionKey = null;
+    let editingId = null; // Tracks which entry is being edited
+
+    async function deriveKey(password, existingSalt = null) {
+        const encoder = new TextEncoder();
+        const saltBuffer = existingSalt ? Uint8Array.from(atob(existingSalt), c => c.charCodeAt(0)) : window.crypto.getRandomValues(new Uint8Array(16));
+        if (!existingSalt) localStorage.setItem('vault_salt', btoa(String.fromCharCode(...saltBuffer)));
+
+        const baseKey = await window.crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveKey"]);
+        return window.crypto.subtle.deriveKey(
+            { name: "PBKDF2", salt: saltBuffer, iterations: 100000, hash: "SHA-256" },
+            baseKey, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]
+        );
+    }
+
+    async function unlockVault() {
+        const password = document.getElementById('password-input').value;
+        try {
+            if (!encryptedData) {
+                sessionKey = await deriveKey(password);
+                await saveData([]); 
+            } else {
+                sessionKey = await deriveKey(password, salt);
+                await decryptData(encryptedData); 
+            }
+            document.getElementById('login-section').classList.add('hidden');
+            document.getElementById('app-section').classList.remove('hidden');
+            renderEntries();
+        } catch (e) { alert("Invalid password."); }
+    }
+
+    async function saveData(data) {
+        const iv = window.crypto.getRandomValues(new Uint8Array(12));
+        const encoded = new TextEncoder().encode(JSON.stringify(data));
+        const ciphertext = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, sessionKey, encoded);
+        const combined = new Uint8Array(iv.length + ciphertext.byteLength);
+        combined.set(iv);
+        combined.set(new Uint8Array(ciphertext), iv.length);
+        localStorage.setItem('vault_data', btoa(String.fromCharCode(...combined)));
+        encryptedData = localStorage.getItem('vault_data');
+    }
+
+    async function decryptData(encodedData) {
+        const combined = Uint8Array.from(atob(encodedData), c => c.charCodeAt(0));
+        const iv = combined.slice(0, 12);
+        const ciphertext = combined.slice(12);
+        const decrypted = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, sessionKey, ciphertext);
+        return JSON.parse(new TextDecoder().decode(decrypted));
+    }
+
+    async function addOrUpdateEntry() {
+        const text = document.getElementById('note-input').value;
+        if (!text) return;
+
+        let data = await decryptData(encryptedData);
+
+        if (editingId) {
+            // Update existing
+            data = data.map(entry => entry.id === editingId ? { ...entry, text } : entry);
+        } else {
+            // Add new
+            data.unshift({ text, date: new Date().toLocaleString(), id: Date.now() });
+        }
+
+        await saveData(data);
+        resetEditor();
+        renderEntries();
+    }
+
+    async function editEntry(id) {
+        const data = await decryptData(encryptedData);
+        const entry = data.find(e => e.id === id);
+        if (entry) {
+            document.getElementById('note-input').value = entry.text;
+            document.getElementById('save-btn').innerText = "Update Entry";
+            document.getElementById('save-btn').style.background = "var(--success)";
+            document.getElementById('cancel-btn').classList.remove('hidden');
+            editingId = id;
+            window.scrollTo(0, 0);
+        }
+    }
+
+    function resetEditor() {
+        editingId = null;
+        document.getElementById('note-input').value = '';
+        document.getElementById('save-btn').innerText = "Save Entry";
+        document.getElementById('save-btn').style.background = "var(--accent)";
+        document.getElementById('cancel-btn').classList.add('hidden');
+    }
+
+    async function renderEntries() {
+        const data = await decryptData(encryptedData);
+        const searchTerm = document.getElementById('search-input').value.toLowerCase();
+        const display = document.getElementById('timeline-display');
+        display.innerHTML = '';
+
+        data.filter(e => e.text.toLowerCase().includes(searchTerm)).forEach(entry => {
+            const div = document.createElement('div');
+            div.className = 'entry';
+            div.innerHTML = `
+                <div class="date">${entry.date}</div>
+                <div class="content">${entry.text.replace(/\n/g, '<br>')}</div>
+                <div class="controls">
+                    <button class="btn-edit" onclick="editEntry(${entry.id})">Edit</button>
+                </div>
+            `;
+            display.appendChild(div);
+        });
+    }
+	
+    function lockVault() { location.reload(); }
+	
+	function exportBackup() {
+    const backup = {
+        data: localStorage.getItem('vault_data'),
+        salt: localStorage.getItem('vault_salt')
+    };
+    const blob = new Blob([JSON.stringify(backup)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `vault_backup_${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+}
+
+async function importBackup() {
+    const jsonStr = prompt("Paste the content of your backup file here:");
+    if (!jsonStr) return;
+    try {
+        const backup = JSON.parse(jsonStr);
+        if (backup.data && backup.salt) {
+            localStorage.setItem('vault_data', backup.data);
+            localStorage.setItem('vault_salt', backup.salt);
+            alert("Backup imported! Please refresh the page.");
+            location.reload();
+        }
+    } catch (e) { alert("Invalid backup format."); }
+}
+</script>
+
+</body>
+</html>
